@@ -1,7 +1,7 @@
 void tensorAdd3D_cpu(
     const float* A,
     const float* B,
-    float* c,
+    float* C,
     int depth,
     int height,
     int width
