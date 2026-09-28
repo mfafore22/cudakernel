@@ -1,6 +1,6 @@
 __global__ void conv1d_kernel(const float* in , float* out, const float* kernel, int input_size, int kernel_size){
     int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int output_szie = input_size - kernel_szie + 1;
+    int output_size = input_size - kernel_szie + 1;
 
     if(output_idx < output_size){
         float sum = 0.0f;
