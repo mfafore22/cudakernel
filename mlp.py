@@ -1,3 +1,9 @@
+import torch
+from torch import nn, optim
+
+learning_rate = 1e-2
+
+
 class MLP(nn.Module):
     def __init__(self, in_features, hidden_features, num_classes):
         super(MLP, self).__init__()
@@ -6,7 +12,7 @@ class MLP(nn.Module):
         self.fc2 = nn.Linear(hidden_features, num_classes)
 
     def forward(self, x):
-        x = x.reshape(batch_size, 28 * 28)
+        x = x.reshape(x.size(0), -1)
         x = self.fc1(x)
         x = self.relu(x)
         x = self.fc2(x)
