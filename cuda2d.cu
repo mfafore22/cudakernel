@@ -1,9 +1,10 @@
-__global__ void conv2d_kernel(const float* in , float* out, const float* kernel, int input_size, int kernel_size){
+__global__ void conv2d_kernel(const float* in, float* out, const float* kernel,
+int height, int width, int kernel_dim){
     int output_col = blockIdx.x * blockDim.x + threadIdx.x;
     int output_row = blockIdx.y * blockDim.y + threadIdx.y;
 
     int output_h = height - kernel_dim + 1;
-    int output_w = width - lernel_dim + 1;
+    int output_w = width - kernel_dim + 1;
 
     if(output_row < output_h && output_col < output_w){
         float sum = 0.0f;
@@ -16,6 +17,6 @@ __global__ void conv2d_kernel(const float* in , float* out, const float* kernel,
             }
         }
         
-        out[output_row * output_w + output_col] = sum
+        out[output_row * output_w + output_col] = sum;
     }
 }
