@@ -1,3 +1,16 @@
+import numpy as np
+
+
+def softmax(Z):
+    # Subtract the row max so exp() can't overflow.
+    exp_Z = np.exp(Z - np.max(Z, axis=1, keepdims=True))
+    return exp_Z / np.sum(exp_Z, axis=1, keepdims=True)
+
+
+def relu_derivative(Z):
+    return (Z > 0).astype(Z.dtype)
+
+
 def backward_batch(X, Z1, A1, Z2, y_true, W1, W2):
     batch_size = X.shape[0]
 
