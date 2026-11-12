@@ -75,3 +75,41 @@ void relu_forward(float *x, int size) {
         x[i] = fmaxf(0.0f, x[i]);
     }
 }
+
+
+void matmul_at_b(float *A, float *B, float *C, int m, int n, int k) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < k; j++) {
+            C[i * k + j] = 0.0f;
+            for (int l = 0; l < m; l++) {
+                C[i * k + j] += A[l * n + i] * B[l * k + j];
+            }
+        }
+    }
+}
+
+void matmul_a_bt(float *A, float *B, float *C, int m, int n, int k) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < k; j++) {
+            C[i * k + j] = 0.0f;
+            for (int l = 0; l < n; l++) {
+                C[i * k + j] += A[i * n + l] * B[j * n + l];
+            }
+        }
+    }
+}
+
+void relu_backward(float *grad, float *x, int size) {
+    for (int i = 0; i < size; i++) {
+        grad[i] *= (x[i] > 0);
+    }
+}
+
+void bias_backward(float *grad_bias, float *grad, int batch_size, int size) {
+    for (int i = 0; i < size; i++) {
+        grad_bias[i] = 0.0f;
+        for (int b = 0; b < batch_size; b++) {
+            grad_bias[i] += grad[b * size + i];
+        }
+    }
+}
