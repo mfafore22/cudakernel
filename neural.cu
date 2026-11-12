@@ -49,3 +49,29 @@ void initialize_neural_network(NeuralNetwork *nn) {
     initialize_bias(nn->bias1, HIDDEN_SIZE);
     initialize_bias(nn->bias2, OUTPUT_SIZE);
 }
+
+
+void matmul_a_b(float *A, float *B, float *C, int m, int n, int k) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < k; j++) {
+            C[i * k + j] = 0.0f;
+            for (int l = 0; l < n; l++) {
+                C[i * k + j] += A[i * n + l] * B[l * k + j];
+            }
+        }
+    }
+}
+
+void bias_forward(float *x, float *bias, int batch_size, int size) {
+    for (int b = 0; b < batch_size; b++) {
+        for (int i = 0; i < size; i++) {
+            x[b * size + i] += bias[i];
+        }
+    }
+}
+
+void relu_forward(float *x, int size) {
+    for (int i = 0; i < size; i++) {
+        x[i] = fmaxf(0.0f, x[i]);
+    }
+}
