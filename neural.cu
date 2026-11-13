@@ -56,4 +56,42 @@ void initialize_random_weights(NeuralNetwork *nn) {
         free(h_bias2);
 }
 
+__global__ void relu_forward_kernel(float *x, int size) { //
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        x[idx] = fmaxf(0.0f, x[idx]);
+    }
+}
+
+__global__ void bias_forward_kernel(float *x, float *bias, int batch_size,
+int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = idx / size; //
+    int i = idx % size;
+
+    if (b < batch_size && i < size) {
+        x[idx] += bias[i];
+    }
+}
+
+__global__ void softmax_kernel(float *x, int batch_size, int size) {
+    int b = blockIdx.x; //
+    if (b < batch_size) {
+        float max_val = x[b * size];
+        for (int i = 1; i < size; ++i) {
+            max_val = fmaxf(max_val, x[b * size + i]); //
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < size; ++i) {
+            x[b * size + i] = expf(x[b * size + i] - max_val);
+            sum += x[b * size + i];
+        }
+
+        for (int i = 0; i < size; ++i) {
+            x[b * size + i] = fmaxf(x[b * size + i] / sum, 1e-7f); //
+        }
+    }
+}
+
 
