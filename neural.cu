@@ -230,4 +230,34 @@ void free_neural_network(NeuralNetwork *nn) {
     CUDA_CHECK(cudaFree(nn->grad_bias2));
 }
 
+void forward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
+        const float alpha = 1.0f, beta = 0.0f;
 
+        CUBLAS_CHECK(cublasSgemm(nn->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                               HIDDEN_SIZE, batch_size, INPUT_SIZE,
+                               &alpha, nn->d_weights1, HIDDEN_SIZE,
+                               nn->d_input_batch, INPUT_SIZE, &beta,
+                               nn->d_fc1_output,
+                               HIDDEN_SIZE));
+
+        int total_hidden = batch_size * HIDDEN_SIZE;
+        int grid_hidden = (total_hidden + 255) / 256;
+        bias_add_kernel<<<grid_hidden, 256>>>(nn->d_fc1_output, nn->d_bias1,
+        batch_size, HIDDEN_SIZE);
+
+        relu_kernel<<<grid_hidden, 256>>>(
+            nn->d_fc1_output, total_hidden);
+
+        CUBLAS_CHECK(cublasSgemm(nn->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                               OUTPUT_SIZE, batch_size, HIDDEN_SIZE,
+                               &alpha, nn->d_weights2, OUTPUT_SIZE,
+                               nn->d_fc1_output, HIDDEN_SIZE, &beta,
+                               nn->d_fc2_output,
+                               OUTPUT_SIZE));
+
+        int total_out = batch_size * OUTPUT_SIZE;
+        int grid_out = (total_out + 255) / 256;
+        bias_add_kernel<<<grid_out, 256>>>(nn->d_fc2_output, nn->d_bias2,
+        batch_size, OUTPUT_SIZE);
+        CUDA_CHECK(cudaDeviceSynchronize());
+}
