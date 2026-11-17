@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 256
@@ -11,11 +12,6 @@
 #define LEARNING_RATE 0.01f
 #define TRAIN_SIZE 10000
 #define TEST_SIZE 10000
-
-typedef struct {
-    float *weights1, *weights2, *bias1, *bias2;
-    float *grad_weights1, *grad_weights2, *grad_bias1, *grad_bias2;
-} NeuralNetwork;
 
 #define CUDA_CHECK(call) \
     do { \
@@ -27,6 +23,28 @@ typedef struct {
             exit(EXIT_FAILURE); \
         } \
     } while(0)
+
+#define CUBLAS_CHECK(call) \
+    do { \
+        cublasStatus_t status = call; \
+        if (status != CUBLAS_STATUS_SUCCESS) { \
+            fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, \
+                    (int)status); \
+            cudaDeviceReset(); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// All d_* are device pointers. Matrices are row-major.
+typedef struct {
+    cublasHandle_t cublas_handle;
+    float *d_weights1, *d_weights2, *d_bias1, *d_bias2;   // [IN x HID], [HID x OUT], [HID], [OUT]
+    float *d_grad_weights1, *d_grad_weights2;             // same shapes as weights
+    float *d_grad_bias1, *d_grad_bias2;                   // same shapes as biases
+    float *d_input_batch;                                 // [BATCH x INPUT_SIZE]
+    float *d_fc1_output;                                  // [BATCH x HIDDEN_SIZE] (after ReLU)
+    float *d_fc2_output;                                  // [BATCH x OUTPUT_SIZE] (logits)
+} NeuralNetworkCUDA;
 
 // Host-side init helpers (same as neural.c) — fill on CPU, then copy to GPU
 void initialize_weights(float *weights, int input_size, int output_size) {
@@ -43,51 +61,68 @@ void initialize_bias(float *bias, int size) {
 }
 
 // Declared here because initialize_neural_network calls it before its definition
-void initialize_random_weights(NeuralNetwork *nn);
+void initialize_random_weights(NeuralNetworkCUDA *nn);
 
-void initialize_neural_network(NeuralNetwork *nn) {
-    CUDA_CHECK(cudaMalloc(&nn->weights1, INPUT_SIZE * HIDDEN_SIZE *
-    sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&nn->weights2, HIDDEN_SIZE * OUTPUT_SIZE *
-    sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&nn->bias1, HIDDEN_SIZE * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&nn->bias2, OUTPUT_SIZE * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&nn->grad_weights1, INPUT_SIZE * HIDDEN_SIZE
-        * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&nn->grad_weights2, HIDDEN_SIZE * OUTPUT_SIZE
-        * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&nn->grad_bias1, HIDDEN_SIZE * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&nn->grad_bias2, OUTPUT_SIZE * sizeof(float)));
-        initialize_random_weights(nn);
+void initialize_neural_network(NeuralNetworkCUDA *nn) {
+    CUBLAS_CHECK(cublasCreate(&nn->cublas_handle));
+
+    CUDA_CHECK(cudaMalloc(&nn->d_weights1, INPUT_SIZE * HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_weights2, HIDDEN_SIZE * OUTPUT_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_bias1, HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_bias2, OUTPUT_SIZE * sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&nn->d_grad_weights1, INPUT_SIZE * HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_grad_weights2, HIDDEN_SIZE * OUTPUT_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_grad_bias1, HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_grad_bias2, OUTPUT_SIZE * sizeof(float)));
+
+    // Activation buffers sized for the largest batch we will run
+    CUDA_CHECK(cudaMalloc(&nn->d_input_batch, BATCH_SIZE * INPUT_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_fc1_output, BATCH_SIZE * HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_fc2_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
+
+    initialize_random_weights(nn);
 }
 
-void initialize_random_weights(NeuralNetwork *nn) {
-    float *h_weights1 = (float *)malloc(INPUT_SIZE * HIDDEN_SIZE
-    * sizeof(float));
-        initialize_weights(h_weights1, INPUT_SIZE, HIDDEN_SIZE);
-        CUDA_CHECK(cudaMemcpy(nn->weights1, h_weights1, INPUT_SIZE
-        * HIDDEN_SIZE * sizeof(float),
-        cudaMemcpyHostToDevice));
-        free(h_weights1);
+void initialize_random_weights(NeuralNetworkCUDA *nn) {
+    float *h_weights1 = (float *)malloc(INPUT_SIZE * HIDDEN_SIZE * sizeof(float));
+    initialize_weights(h_weights1, INPUT_SIZE, HIDDEN_SIZE);
+    CUDA_CHECK(cudaMemcpy(nn->d_weights1, h_weights1,
+        INPUT_SIZE * HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+    free(h_weights1);
 
-        float *h_weights2 = (float *)malloc(HIDDEN_SIZE * OUTPUT_SIZE
-        * sizeof(float));
-        initialize_weights(h_weights2, HIDDEN_SIZE, OUTPUT_SIZE);
-        CUDA_CHECK(cudaMemcpy(nn->weights2, h_weights2, HIDDEN_SIZE
-        * OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
-        free(h_weights2);
+    float *h_weights2 = (float *)malloc(HIDDEN_SIZE * OUTPUT_SIZE * sizeof(float));
+    initialize_weights(h_weights2, HIDDEN_SIZE, OUTPUT_SIZE);
+    CUDA_CHECK(cudaMemcpy(nn->d_weights2, h_weights2,
+        HIDDEN_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+    free(h_weights2);
 
-        float *h_bias1 = (float *)malloc(HIDDEN_SIZE * sizeof(float));
-        initialize_bias(h_bias1, HIDDEN_SIZE);
-        CUDA_CHECK(cudaMemcpy(nn->bias1, h_bias1, HIDDEN_SIZE
-        * sizeof(float), cudaMemcpyHostToDevice));
-        free(h_bias1);
+    float *h_bias1 = (float *)malloc(HIDDEN_SIZE * sizeof(float));
+    initialize_bias(h_bias1, HIDDEN_SIZE);
+    CUDA_CHECK(cudaMemcpy(nn->d_bias1, h_bias1,
+        HIDDEN_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+    free(h_bias1);
 
-        float *h_bias2 = (float *)malloc(OUTPUT_SIZE * sizeof(float));
-        initialize_bias(h_bias2, OUTPUT_SIZE);
-        CUDA_CHECK(cudaMemcpy(nn->bias2, h_bias2, OUTPUT_SIZE
-        * sizeof(float), cudaMemcpyHostToDevice));
-        free(h_bias2);
+    float *h_bias2 = (float *)malloc(OUTPUT_SIZE * sizeof(float));
+    initialize_bias(h_bias2, OUTPUT_SIZE);
+    CUDA_CHECK(cudaMemcpy(nn->d_bias2, h_bias2,
+        OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+    free(h_bias2);
+}
+
+void free_neural_network(NeuralNetworkCUDA *nn) {
+    CUDA_CHECK(cudaFree(nn->d_weights1));
+    CUDA_CHECK(cudaFree(nn->d_weights2));
+    CUDA_CHECK(cudaFree(nn->d_bias1));
+    CUDA_CHECK(cudaFree(nn->d_bias2));
+    CUDA_CHECK(cudaFree(nn->d_grad_weights1));
+    CUDA_CHECK(cudaFree(nn->d_grad_weights2));
+    CUDA_CHECK(cudaFree(nn->d_grad_bias1));
+    CUDA_CHECK(cudaFree(nn->d_grad_bias2));
+    CUDA_CHECK(cudaFree(nn->d_input_batch));
+    CUDA_CHECK(cudaFree(nn->d_fc1_output));
+    CUDA_CHECK(cudaFree(nn->d_fc2_output));
+    CUBLAS_CHECK(cublasDestroy(nn->cublas_handle));
 }
 
 __global__ void relu_forward_kernel(float *x, int size) { //
@@ -130,106 +165,6 @@ __global__ void softmax_kernel(float *x, int batch_size, int size) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Matrix multiply kernels (GPU versions of the CPU matmuls in neural.c)
-// All matrices are row-major. Each thread computes ONE output element.
-// Launch with 2D grid: x covers columns, y covers rows.
-// ---------------------------------------------------------------------------
-
-#define TILE 16
-
-// C[m x k] = A[m x n] @ B[n x k]          (used in forward pass)
-__global__ void matmul_a_b_kernel(float *A, float *B, float *C,
-int m, int n, int k) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < m && col < k) {
-        float sum = 0.0f;   // accumulate in a register, write once
-        for (int l = 0; l < n; ++l) {
-            sum += A[row * n + l] * B[l * k + col];
-        }
-        C[row * k + col] = sum;
-    }
-}
-
-// C[n x k] = A^T @ B,  A is [m x n], B is [m x k]   (weight gradients)
-__global__ void matmul_at_b_kernel(float *A, float *B, float *C,
-int m, int n, int k) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;   // 0..n-1
-    int col = blockIdx.x * blockDim.x + threadIdx.x;   // 0..k-1
-    if (row < n && col < k) {
-        float sum = 0.0f;
-        for (int l = 0; l < m; ++l) {
-            sum += A[l * n + row] * B[l * k + col];
-        }
-        C[row * k + col] = sum;
-    }
-}
-
-// C[m x k] = A @ B^T,  A is [m x n], B is [k x n]   (input gradients)
-__global__ void matmul_a_bt_kernel(float *A, float *B, float *C,
-int m, int n, int k) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;   // 0..m-1
-    int col = blockIdx.x * blockDim.x + threadIdx.x;   // 0..k-1
-    if (row < m && col < k) {
-        float sum = 0.0f;
-        for (int l = 0; l < n; ++l) {
-            sum += A[row * n + l] * B[col * n + l];
-        }
-        C[row * k + col] = sum;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Forward pass. All pointers are DEVICE pointers.
-//   d_input  : [batch_size x INPUT_SIZE]
-//   d_hidden : [batch_size x HIDDEN_SIZE]  (keeps ReLU output for backward)
-//   d_output : [batch_size x OUTPUT_SIZE]  (softmax probabilities)
-// ---------------------------------------------------------------------------
-void forward(NeuralNetwork *nn, float *d_input, float *d_hidden,
-float *d_output, int batch_size) {
-    dim3 block(TILE, TILE);
-
-    // Layer 1: hidden = relu(input @ W1 + b1)
-    dim3 grid1((HIDDEN_SIZE + TILE - 1) / TILE, (batch_size + TILE - 1) / TILE);
-    matmul_a_b_kernel<<<grid1, block>>>(d_input, nn->weights1, d_hidden,
-        batch_size, INPUT_SIZE, HIDDEN_SIZE);
-    CUDA_CHECK(cudaGetLastError());
-
-    int n_hidden = batch_size * HIDDEN_SIZE;
-    bias_forward_kernel<<<(n_hidden + 255) / 256, 256>>>(d_hidden, nn->bias1,
-        batch_size, HIDDEN_SIZE);
-    CUDA_CHECK(cudaGetLastError());
-
-    relu_forward_kernel<<<(n_hidden + 255) / 256, 256>>>(d_hidden, n_hidden);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Layer 2: output = softmax(hidden @ W2 + b2)
-    dim3 grid2((OUTPUT_SIZE + TILE - 1) / TILE, (batch_size + TILE - 1) / TILE);
-    matmul_a_b_kernel<<<grid2, block>>>(d_hidden, nn->weights2, d_output,
-        batch_size, HIDDEN_SIZE, OUTPUT_SIZE);
-    CUDA_CHECK(cudaGetLastError());
-
-    int n_out = batch_size * OUTPUT_SIZE;
-    bias_forward_kernel<<<(n_out + 255) / 256, 256>>>(d_output, nn->bias2,
-        batch_size, OUTPUT_SIZE);
-    CUDA_CHECK(cudaGetLastError());
-
-    softmax_kernel<<<batch_size, 1>>>(d_output, batch_size, OUTPUT_SIZE);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void free_neural_network(NeuralNetwork *nn) {
-    CUDA_CHECK(cudaFree(nn->weights1));
-    CUDA_CHECK(cudaFree(nn->weights2));
-    CUDA_CHECK(cudaFree(nn->bias1));
-    CUDA_CHECK(cudaFree(nn->bias2));
-    CUDA_CHECK(cudaFree(nn->grad_weights1));
-    CUDA_CHECK(cudaFree(nn->grad_weights2));
-    CUDA_CHECK(cudaFree(nn->grad_bias1));
-    CUDA_CHECK(cudaFree(nn->grad_bias2));
-}
-
 void forward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
         const float alpha = 1.0f, beta = 0.0f;
 
@@ -242,10 +177,10 @@ void forward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
 
         int total_hidden = batch_size * HIDDEN_SIZE;
         int grid_hidden = (total_hidden + 255) / 256;
-        bias_add_kernel<<<grid_hidden, 256>>>(nn->d_fc1_output, nn->d_bias1,
+        bias_forward_kernel<<<grid_hidden, 256>>>(nn->d_fc1_output, nn->d_bias1,
         batch_size, HIDDEN_SIZE);
 
-        relu_kernel<<<grid_hidden, 256>>>(
+        relu_forward_kernel<<<grid_hidden, 256>>>(
             nn->d_fc1_output, total_hidden);
 
         CUBLAS_CHECK(cublasSgemm(nn->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -257,7 +192,7 @@ void forward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
 
         int total_out = batch_size * OUTPUT_SIZE;
         int grid_out = (total_out + 255) / 256;
-        bias_add_kernel<<<grid_out, 256>>>(nn->d_fc2_output, nn->d_bias2,
+        bias_forward_kernel<<<grid_out, 256>>>(nn->d_fc2_output, nn->d_bias2,
         batch_size, OUTPUT_SIZE);
         CUDA_CHECK(cudaDeviceSynchronize());
 }
