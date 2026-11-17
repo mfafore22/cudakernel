@@ -44,6 +44,8 @@ typedef struct {
     float *d_input_batch;                                 // [BATCH x INPUT_SIZE]
     float *d_fc1_output;                                  // [BATCH x HIDDEN_SIZE] (after ReLU)
     float *d_fc2_output;                                  // [BATCH x OUTPUT_SIZE] (logits)
+    float *d_grad_output;                                 // [BATCH x OUTPUT_SIZE] dLoss/dlogits
+    float *d_grad_hidden;                                 // [BATCH x HIDDEN_SIZE] dLoss/dhidden
 } NeuralNetworkCUDA;
 
 // Host-side init helpers (same as neural.c) — fill on CPU, then copy to GPU
@@ -80,6 +82,8 @@ void initialize_neural_network(NeuralNetworkCUDA *nn) {
     CUDA_CHECK(cudaMalloc(&nn->d_input_batch, BATCH_SIZE * INPUT_SIZE * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&nn->d_fc1_output, BATCH_SIZE * HIDDEN_SIZE * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&nn->d_fc2_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_grad_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_grad_hidden, BATCH_SIZE * HIDDEN_SIZE * sizeof(float)));
 
     initialize_random_weights(nn);
 }
@@ -122,6 +126,8 @@ void free_neural_network(NeuralNetworkCUDA *nn) {
     CUDA_CHECK(cudaFree(nn->d_input_batch));
     CUDA_CHECK(cudaFree(nn->d_fc1_output));
     CUDA_CHECK(cudaFree(nn->d_fc2_output));
+    CUDA_CHECK(cudaFree(nn->d_grad_output));
+    CUDA_CHECK(cudaFree(nn->d_grad_hidden));
     CUBLAS_CHECK(cublasDestroy(nn->cublas_handle));
 }
 
@@ -140,6 +146,28 @@ int size) {
 
     if (b < batch_size && i < size) {
         x[idx] += bias[i];
+    }
+}
+
+// grad[i] *= (x[i] > 0). x is the ReLU output; post-ReLU > 0 exactly when
+// pre-ReLU > 0, so the mask is the same.
+__global__ void relu_backward_kernel(float *grad, float *x, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        grad[idx] *= (x[idx] > 0.0f) ? 1.0f : 0.0f;
+    }
+}
+
+// grad_bias[i] = sum over batch of grad[b][i].
+// One thread per element of grad, so threads in different rows add into the
+// same grad_bias[i] -> atomicAdd. grad_bias must be zeroed first (your
+// cudaMemset in backward_pass_only does that).
+__global__ void bias_backward_kernel(float *grad, float *grad_bias,
+int batch_size, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * size) {
+        int i = idx % size;
+        atomicAdd(&grad_bias[i], grad[idx]);
     }
 }
 
