@@ -196,3 +196,49 @@ void forward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
         batch_size, OUTPUT_SIZE);
         CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+
+void backward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
+    const float alpha = 1.0f, beta = 0.0f;
+
+    CUDA_CHECK(cudaMemset(nn->d_grad_weights1, 0, INPUT_SIZE *
+    HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMemset(nn->d_grad_weights2, 0, HIDDEN_SIZE *
+    OUTPUT_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMemset(nn->d_grad_bias1, 0, HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMemset(nn->d_grad_bias2, 0, OUTPUT_SIZE * sizeof(float)));
+
+    CUBLAS_CHECK(cublasSgemm(nn->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                           OUTPUT_SIZE, HIDDEN_SIZE, batch_size,
+                           &alpha, nn->d_grad_output, OUTPUT_SIZE,
+                           nn->d_fc1_output, HIDDEN_SIZE, &beta,
+                           nn->d_grad_weights2,
+                           OUTPUT_SIZE));
+
+    int total_out = batch_size * OUTPUT_SIZE;
+    int grid_out = (total_out + 255) / 256;
+    bias_backward_kernel<<<grid_out, 256>>>(nn->d_grad_output,
+    nn->d_grad_bias2, batch_size, OUTPUT_SIZE);
+
+    CUBLAS_CHECK(cublasSgemm(nn->cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                           HIDDEN_SIZE, batch_size, OUTPUT_SIZE,
+                           &alpha, nn->d_weights2, OUTPUT_SIZE,
+                           nn->d_grad_output, OUTPUT_SIZE, &beta,
+                           nn->d_grad_hidden,
+                           HIDDEN_SIZE));
+
+    int total_hidden = batch_size * HIDDEN_SIZE;
+    int grid_hidden = (total_hidden + 255) / 256;
+    relu_backward_kernel<<<grid_hidden, 256>>>(nn->d_grad_hidden,
+    nn->d_fc1_output, total_hidden);
+
+    CUBLAS_CHECK(cublasSgemm(nn->cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                           HIDDEN_SIZE, INPUT_SIZE, batch_size,
+                           &alpha, nn->d_grad_hidden, HIDDEN_SIZE,
+                           nn->d_input_batch, INPUT_SIZE, &beta,
+                           nn->d_grad_weights1,
+                           HIDDEN_SIZE));
+
+    bias_backward_kernel<<<grid_hidden, 256>>>(nn->d_grad_hidden,
+    nn->d_grad_bias1, batch_size, HIDDEN_SIZE);
+}
