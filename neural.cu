@@ -46,6 +46,7 @@ typedef struct {
     float *d_fc2_output;                                  // [BATCH x OUTPUT_SIZE] (logits)
     float *d_grad_output;                                 // [BATCH x OUTPUT_SIZE] dLoss/dlogits
     float *d_grad_hidden;                                 // [BATCH x HIDDEN_SIZE] dLoss/dhidden
+    int   *d_labels;                                      // [BATCH] class index 0..OUTPUT_SIZE-1
 } NeuralNetworkCUDA;
 
 // Host-side init helpers (same as neural.c) — fill on CPU, then copy to GPU
@@ -84,6 +85,7 @@ void initialize_neural_network(NeuralNetworkCUDA *nn) {
     CUDA_CHECK(cudaMalloc(&nn->d_fc2_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&nn->d_grad_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&nn->d_grad_hidden, BATCH_SIZE * HIDDEN_SIZE * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&nn->d_labels, BATCH_SIZE * sizeof(int)));
 
     initialize_random_weights(nn);
 }
@@ -128,6 +130,7 @@ void free_neural_network(NeuralNetworkCUDA *nn) {
     CUDA_CHECK(cudaFree(nn->d_fc2_output));
     CUDA_CHECK(cudaFree(nn->d_grad_output));
     CUDA_CHECK(cudaFree(nn->d_grad_hidden));
+    CUDA_CHECK(cudaFree(nn->d_labels));
     CUBLAS_CHECK(cublasDestroy(nn->cublas_handle));
 }
 
@@ -269,4 +272,85 @@ void backward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
 
     bias_backward_kernel<<<grid_hidden, 256>>>(nn->d_grad_hidden,
     nn->d_grad_bias1, batch_size, HIDDEN_SIZE);
+}
+
+// ---------------------------------------------------------------------------
+// Loss gradient: softmax + cross-entropy combined.
+//   grad_output[b][i] = (softmax(logits[b])[i] - (i == label[b])) / batch_size
+// One thread per sample (OUTPUT_SIZE is only 10). Reads logits without
+// modifying them. Also writes each sample's loss -log(p[label]) so you can
+// print the average loss during training.
+// ---------------------------------------------------------------------------
+__global__ void compute_output_gradients_kernel(float *grad_output,
+const float *logits, const int *labels, float *losses, int batch_size) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < batch_size) {
+        const float *z = logits + b * OUTPUT_SIZE;
+        float *g = grad_output + b * OUTPUT_SIZE;
+
+        float max_val = z[0];
+        for (int i = 1; i < OUTPUT_SIZE; ++i) {
+            max_val = fmaxf(max_val, z[i]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < OUTPUT_SIZE; ++i) {
+            g[i] = expf(z[i] - max_val);   // use g as scratch for exp values
+            sum += g[i];
+        }
+
+        int label = labels[b];
+        for (int i = 0; i < OUTPUT_SIZE; ++i) {
+            float p = g[i] / sum;
+            if (i == label) {
+                losses[b] = -logf(fmaxf(p, 1e-7f));
+            }
+            g[i] = (p - (i == label ? 1.0f : 0.0f)) / batch_size;
+        }
+    }
+}
+
+// Copies labels to the GPU, fills d_grad_output, returns the average loss.
+// Call after forward_pass_only and before backward_pass_only.
+float compute_output_gradients(NeuralNetworkCUDA *nn, const int *h_labels,
+int batch_size) {
+    CUDA_CHECK(cudaMemcpy(nn->d_labels, h_labels, batch_size * sizeof(int),
+        cudaMemcpyHostToDevice));
+
+    // Per-sample losses go into d_grad_hidden as scratch space: it's
+    // [BATCH x HIDDEN_SIZE], far bigger than batch_size floats, and the
+    // backward pass overwrites it anyway.
+    float *d_losses = nn->d_grad_hidden;
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    compute_output_gradients_kernel<<<blocks, threads>>>(nn->d_grad_output,
+        nn->d_fc2_output, nn->d_labels, d_losses, batch_size);
+    CUDA_CHECK(cudaGetLastError());
+
+    float h_losses[BATCH_SIZE];
+    CUDA_CHECK(cudaMemcpy(h_losses, d_losses, batch_size * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    float total = 0.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        total += h_losses[b];
+    }
+    return total / batch_size;
+}
+
+// ---------------------------------------------------------------------------
+// SGD update: param -= LEARNING_RATE * grad, using cublasSaxpy
+// (y = alpha * x + y with alpha = -LEARNING_RATE).
+// ---------------------------------------------------------------------------
+void update_weights(NeuralNetworkCUDA *nn) {
+    const float alpha = -LEARNING_RATE;
+
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, INPUT_SIZE * HIDDEN_SIZE,
+        &alpha, nn->d_grad_weights1, 1, nn->d_weights1, 1));
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, HIDDEN_SIZE * OUTPUT_SIZE,
+        &alpha, nn->d_grad_weights2, 1, nn->d_weights2, 1));
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, HIDDEN_SIZE,
+        &alpha, nn->d_grad_bias1, 1, nn->d_bias1, 1));
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, OUTPUT_SIZE,
+        &alpha, nn->d_grad_bias2, 1, nn->d_bias2, 1));
 }
