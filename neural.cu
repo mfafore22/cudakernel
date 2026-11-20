@@ -270,3 +270,24 @@ void backward_pass_only(NeuralNetworkCUDA *nn, int batch_size) {
     bias_backward_kernel<<<grid_hidden, 256>>>(nn->d_grad_hidden,
     nn->d_grad_bias1, batch_size, HIDDEN_SIZE);
 }
+
+
+// SGD update: param = param - lr * grad, via cublasSaxpy (y = alpha*x + y)
+void update_weights_only(NeuralNetworkCUDA *nn, float lr) {
+    float neg_lr = -lr;
+
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, INPUT_SIZE * HIDDEN_SIZE,
+                           &neg_lr, nn->d_grad_weights1, 1,
+                           nn->d_weights1, 1));
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, HIDDEN_SIZE * OUTPUT_SIZE,
+                           &neg_lr, nn->d_grad_weights2, 1,
+                           nn->d_weights2, 1));
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, HIDDEN_SIZE,
+                           &neg_lr, nn->d_grad_bias1, 1,
+                           nn->d_bias1, 1));
+    CUBLAS_CHECK(cublasSaxpy(nn->cublas_handle, OUTPUT_SIZE,
+                           &neg_lr, nn->d_grad_bias2, 1,
+                           nn->d_bias2, 1));
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
